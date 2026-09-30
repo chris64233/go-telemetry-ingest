@@ -119,41 +119,54 @@ func appendFrame(w io.Writer, typ byte, payload []byte) error {
 }
 
 // readFrames 从 r 顺序读取帧。handle 处理一帧；返回（读取字节数, error）。
-// 遇到 io.EOF（干净结束）或 io.ErrUnexpectedEOF（尾部半帧）/CRC 错误时停止，
-// 由调用方按 goodBytes 截断。
+// 干净结束时返回 nil；遇到尾部半帧（含短读）、magic 或 CRC 错误时停止并
+// 返回 io.ErrUnexpectedEOF，由调用方按 goodBytes 截断；真正的底层读取
+// 错误原样返回，不得静默截断。
 func readFrames(r io.ReaderAt, size int64, handle func(typ byte, payload []byte) error) (int64, error) {
 	var off int64
 	for off < size {
 		var hdr [frameHeader]byte
-		n, err := r.ReadAt(hdr[:], off)
-		if err == io.EOF && n == 0 {
-			return off, io.EOF
-		}
-		if n < frameHeader {
-			return off, io.ErrUnexpectedEOF // 半帧
-		}
-		if err != nil && err != io.EOF {
+		// ReadAt 在超过数据末尾时可能以 (n>0, io.EOF) 返回短读；
+		// io.ReadFull 把「读到的字节少于请求」统一成 ErrUnexpectedEOF。
+		if _, err := io.ReadFull(io.NewSectionReader(r, off, frameHeader), hdr[:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				return off, nil
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return off, io.ErrUnexpectedEOF // 半帧
+			}
 			return off, err
 		}
 		if string(hdr[0:4]) != frameMagic {
-			return off, fmt.Errorf("bad frame magic at %d", off)
+			// 帧边界已损坏（例如写到一半崩溃且尾部恰好凑够长度）：
+			// 追加式 WAL 中这只能出现在当前尾部，交给调用方截断。
+			return off, io.ErrUnexpectedEOF
 		}
 		typ := hdr[4]
 		plen := int64(binary.BigEndian.Uint64(hdr[5:13]))
-		if plen < 0 || off+frameHeader+plen+frameTrailer > size {
+		if plen < 0 || off > size-frameHeader-plen-frameTrailer {
 			return off, io.ErrUnexpectedEOF // 载荷或 CRC 不完整
 		}
 		payload := make([]byte, plen)
-		if _, err := r.ReadAt(payload, off+frameHeader); err != nil && err != io.EOF {
+		if _, err := io.ReadFull(io.NewSectionReader(r, off+frameHeader, plen), payload); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return off, io.ErrUnexpectedEOF
+			}
 			return off, err
 		}
 		var crcBuf [4]byte
-		if _, err := r.ReadAt(crcBuf[:], off+frameHeader+plen); err != nil && err != io.EOF {
+		if _, err := io.ReadFull(io.NewSectionReader(r, off+frameHeader+plen, frameTrailer), crcBuf[:]); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return off, io.ErrUnexpectedEOF
+			}
 			return off, err
 		}
 		want := crc32.Checksum(append(hdr[4:13], payload...), crcTable)
 		if binary.BigEndian.Uint32(crcBuf[:]) != want {
-			return off, fmt.Errorf("crc mismatch at %d", off)
+			// CRC 不匹配：该帧写到一半或页缓存撕裂。WAL 只追加且
+			// 帧内含完整设备状态，此帧之后不可能再有有效帧，按尾部
+			// 半帧截断（与 magic 损坏同样处理）。
+			return off, io.ErrUnexpectedEOF
 		}
 		if err := handle(typ, payload); err != nil {
 			return off, err
@@ -212,7 +225,9 @@ func (s *FileStore) loadSnapshot() error {
 		ok = true
 		return nil
 	})
-	if err != nil && !errors.Is(err, io.EOF) {
+	// 快照经 tmp+fsync+原子 rename 落盘：任何损坏（含半帧/CRC）都说明
+	// 介质或文件系统异常，不能静默丢弃已确认状态，保持致命错误。
+	if err != nil {
 		return fmt.Errorf("recover snapshot: %w", err)
 	}
 	if !ok {
@@ -242,7 +257,7 @@ func (s *FileStore) openAndReplayWAL() error {
 			return fmt.Errorf("unexpected frame type %d in wal", typ)
 		}
 	})
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		f.Close()
 		return fmt.Errorf("replay wal: %w", err)
 	}
