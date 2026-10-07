@@ -189,6 +189,125 @@ func TestHTTPEndToEnd(t *testing.T) {
 	}
 }
 
+// TestHTTPCalibrationFlow 用 ResponseRecorder 验证标定相关 HTTP 接口，
+// 不依赖端口绑定。
+func TestHTTPCalibrationFlow(t *testing.T) {
+	svc := NewService(NewMemoryStore())
+	h := NewHTTPServer(svc, nil)
+
+	code, out := doJSON(t, h, http.MethodPut, "/v1/devices/d", map[string]int64{"window": 10})
+	if code != http.StatusCreated {
+		t.Fatalf("register: %d %v", code, out)
+	}
+
+	// 设备视图：含基线标定。
+	code, out = doJSON(t, h, http.MethodGet, "/v1/devices/d", nil)
+	if code != http.StatusOK || out["currentCalibrationId"] != BaselineCalibrationID {
+		t.Fatalf("device view: %d %v", code, out)
+	}
+	cals := out["calibrations"].([]any)
+	if len(cals) != 1 {
+		t.Fatalf("baseline calibration missing: %v", cals)
+	}
+
+	// 登记标定版本 c1，seq3 生效。
+	calBody := map[string]any{
+		"calibrationId": "c1", "parameterDigest": "sha256:abc",
+		"effectiveSeq": 3, "operator": "ops",
+	}
+	code, out = doJSON(t, h, http.MethodPut, "/v1/devices/d/calibrations", calBody)
+	if code != http.StatusCreated || out["currentCalibrationId"] != BaselineCalibrationID {
+		t.Fatalf("apply calibration: %d %v", code, out)
+	}
+	// 相同标定号重放 → 200 duplicate=true。
+	code, out = doJSON(t, h, http.MethodPut, "/v1/devices/d/calibrations", calBody)
+	if code != http.StatusOK || out["duplicate"] != true {
+		t.Fatalf("calibration replay: %d %v", code, out)
+	}
+	// 参数变化重放 → 409。
+	tampered := map[string]any{
+		"calibrationId": "c1", "parameterDigest": "sha256:zzz",
+		"effectiveSeq": 3, "operator": "ops",
+	}
+	code, out = doJSON(t, h, http.MethodPut, "/v1/devices/d/calibrations", tampered)
+	if code != http.StatusConflict {
+		t.Fatalf("calibration conflict: %d %v", code, out)
+	}
+	// 生效序号早于确认读数 → 400。
+	evBody := map[string]any{
+		"sequence": 1, "eventTime": "2026-10-01T00:00:01Z",
+		"metric": "temp", "value": 10,
+	}
+	code, _ = doJSON(t, h, http.MethodPost, "/v1/devices/d/events", evBody)
+	if code != http.StatusOK {
+		t.Fatalf("event1: %d", code)
+	}
+	oldCal := map[string]any{
+		"calibrationId": "old", "parameterDigest": "x",
+		"effectiveSeq": 1, "operator": "ops",
+	}
+	code, out = doJSON(t, h, http.MethodPut, "/v1/devices/d/calibrations", oldCal)
+	if code != http.StatusBadRequest {
+		t.Fatalf("stale calibration: %d %v", code, out)
+	}
+
+	// seq2 基线、seq3 起 c1。
+	evBody = map[string]any{
+		"sequence": 2, "eventTime": "2026-10-01T00:00:02Z",
+		"metric": "temp", "value": 20,
+	}
+	code, out = doJSON(t, h, http.MethodPost, "/v1/devices/d/events", evBody)
+	if code != http.StatusOK || out["calibrationId"] != BaselineCalibrationID {
+		t.Fatalf("event2 binding: %d %v", code, out)
+	}
+	evBody = map[string]any{
+		"sequence": 3, "eventTime": "2026-10-01T00:00:03Z",
+		"metric": "temp", "value": 30,
+	}
+	code, out = doJSON(t, h, http.MethodPost, "/v1/devices/d/events", evBody)
+	if code != http.StatusOK || out["calibrationId"] != "c1" {
+		t.Fatalf("event3 binding: %d %v", code, out)
+	}
+
+	// 标定历史与汇总。
+	code, out = doJSON(t, h, http.MethodGet, "/v1/devices/d/calibrations", nil)
+	if code != http.StatusOK || out["currentCalibrationId"] != "c1" ||
+		len(out["calibrations"].([]any)) != 2 {
+		t.Fatalf("calibration history: %d %v", code, out)
+	}
+	code, out = doJSON(t, h, http.MethodGet, "/v1/devices/d/summary", nil)
+	if code != http.StatusOK {
+		t.Fatalf("summary: %d", code)
+	}
+	current := out["current"].(map[string]any)
+	if current["calibrationId"] != "c1" || current["eventCount"].(float64) != 1 {
+		t.Fatalf("current agg: %v", current)
+	}
+	history := out["history"].([]any)
+	h0 := history[0].(map[string]any)
+	if h0["calibrationId"] != BaselineCalibrationID || h0["current"] != false ||
+		h0["eventCount"].(float64) != 2 {
+		t.Fatalf("history baseline: %v", h0)
+	}
+
+	// 读数查询含标定采用依据。
+	code, out = doJSON(t, h, http.MethodGet, "/v1/devices/d/events?from=3", nil)
+	evs := out["events"].([]any)
+	e3 := evs[0].(map[string]any)
+	if e3["calibrationId"] != "c1" ||
+		e3["calibrationEffectiveSeq"].(float64) != 3 ||
+		e3["calibrationDigest"] != "sha256:abc" {
+		t.Fatalf("event adoption basis: %v", e3)
+	}
+
+	// 同标定号用于另一台设备 → 409。
+	doJSON(t, h, http.MethodPut, "/v1/devices/other", map[string]int64{"window": 10})
+	code, out = doJSON(t, h, http.MethodPut, "/v1/devices/other/calibrations", calBody)
+	if code != http.StatusConflict {
+		t.Fatalf("cross-device calibration id: %d %v", code, out)
+	}
+}
+
 func TestHTTPServerWithFileStore(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	fs, err := OpenFileStore(dir)

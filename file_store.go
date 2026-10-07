@@ -174,6 +174,9 @@ func (s *FileStore) applyDeviceFrame(payload []byte) error {
 	if fr.State.Events == nil {
 		fr.State.Events = make(map[int64]*storedEvent)
 	}
+	if fr.State.CalAggs == nil {
+		fr.State.CalAggs = make(map[string]*CalibrationAggregate)
+	}
 	s.devices[fr.State.ID] = fr.State
 	return nil
 }
@@ -206,6 +209,9 @@ func (s *FileStore) loadSnapshot() error {
 			}
 			if st.Events == nil {
 				st.Events = make(map[int64]*storedEvent)
+			}
+			if st.CalAggs == nil {
+				st.CalAggs = make(map[string]*CalibrationAggregate)
 			}
 			s.devices[st.ID] = st
 		}

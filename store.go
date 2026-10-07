@@ -2,6 +2,7 @@ package gotelemetryingest
 
 import (
 	"errors"
+	"math"
 	"time"
 )
 
@@ -23,6 +24,10 @@ type deviceState struct {
 	ClosedSeq    int64     `json:"closedSeq"`
 	// Events 保存所有原始事件（含窗口内暂存的），键为序号。
 	Events map[int64]*storedEvent `json:"events"`
+	// Calibrations 标定版本历史，按生效序号升序；首个元素恒为基线版本。
+	Calibrations []Calibration `json:"calibrations"`
+	// CalAggs 各标定版本已确认读数的聚合，键为标定号；与读数在同一帧累计。
+	CalAggs map[string]*CalibrationAggregate `json:"calAggs"`
 	// SealedGaps 已被水位永久封闭的缺口（按 Start 升序）。
 	SealedGaps []SealedGap `json:"sealedGaps"`
 	// Rejections 被拒绝的提交及原因（按时间追加）。
@@ -44,6 +49,18 @@ func newDeviceState(d Device) *deviceState {
 		RegisteredAt: d.RegisteredAt,
 		Version:      1,
 		Events:       make(map[int64]*storedEvent),
+		Calibrations: []Calibration{{
+			ID:           BaselineCalibrationID,
+			EffectiveSeq: 1,
+			Operator:     "system",
+			AppliedAt:    d.RegisteredAt,
+		}},
+		CalAggs: map[string]*CalibrationAggregate{
+			BaselineCalibrationID: {
+				CalibrationID: BaselineCalibrationID,
+				EffectiveSeq:  1,
+			},
+		},
 	}
 }
 
@@ -56,12 +73,20 @@ func (s *deviceState) clone() *deviceState {
 	}
 	c.SealedGaps = append([]SealedGap(nil), s.SealedGaps...)
 	c.Rejections = append([]Rejection(nil), s.Rejections...)
+	c.Calibrations = append([]Calibration(nil), s.Calibrations...)
+	if s.CalAggs != nil {
+		c.CalAggs = make(map[string]*CalibrationAggregate, len(s.CalAggs))
+		for k, v := range s.CalAggs {
+			a := *v
+			c.CalAggs[k] = &a
+		}
+	}
 	return &c
 }
 
 // summary 从持久化状态构造对外的汇总视图。
 func (s *deviceState) summary() Summary {
-	return Summary{
+	sum := Summary{
 		DeviceID:       s.ID,
 		AckedSeq:       s.AckedSeq,
 		ClosedSeq:      s.ClosedSeq,
@@ -73,6 +98,35 @@ func (s *deviceState) summary() Summary {
 		LastEventTime:  s.LastTime,
 		UpdatedAt:      s.UpdatedAt,
 	}
+	cur := currentCalibration(s)
+	sum.CurrentCalibrationID = cur.ID
+	for i, c := range s.Calibrations {
+		agg, ok := s.CalAggs[c.ID]
+		if !ok {
+			agg = &CalibrationAggregate{
+				CalibrationID:   c.ID,
+				EffectiveSeq:    c.EffectiveSeq,
+				ParameterDigest: c.ParameterDigest,
+			}
+		}
+		entry := *agg
+		entry.CalibrationID = c.ID
+		entry.EffectiveSeq = c.EffectiveSeq
+		entry.ParameterDigest = c.ParameterDigest
+		entry.Current = c.ID == cur.ID
+		// 该版本的生效区间 [effectiveSeq, end] 完全落入关闭水位之下时，
+		// 聚合永久冻结：后续迟到读数只能被记录为 late，不能回写该聚合。
+		end := int64(math.MaxInt64)
+		if i+1 < len(s.Calibrations) {
+			end = s.Calibrations[i+1].EffectiveSeq - 1
+		}
+		entry.Frozen = end <= s.ClosedSeq
+		sum.History = append(sum.History, entry)
+		if entry.Current {
+			sum.Current = entry
+		}
+	}
+	return sum
 }
 
 // Store 是设备状态的持久化抽象。

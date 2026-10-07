@@ -14,9 +14,13 @@ import (
 // HTTP API（所有时间均为 RFC3339Nano UTC）：
 //
 //	PUT    /v1/devices/:id                    登记设备        {"window": 10}
+//	GET    /v1/devices/:id                    设备视图（设备/标定历史/当前版本）
 //	POST   /v1/devices/:id/events             接收事件
 //	      {"sequence":1,"eventTime":"2026-09-28T00:00:00Z","metric":"m","value":1.5}
+//	PUT    /v1/devices/:id/calibrations       登记/重放标定版本
+//	      {"calibrationId":"c1","parameterDigest":"sha256:..","effectiveSeq":10,"operator":"ops"}
 //	POST   /v1/devices/:id/watermark          推进关闭水位    {"closedSeq": 5}
+//	GET    /v1/devices/:id/calibrations       标定历史
 //	GET    /v1/devices/:id/gaps               缺口查询
 //	GET    /v1/devices/:id/events?from=&limit= 原始事件查询
 //	GET    /v1/devices/:id/summary            汇总查询
@@ -46,7 +50,10 @@ func NewHTTPServer(svc *Service, logger *log.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/devices", s.listDevices)
 	mux.HandleFunc("PUT /v1/devices/{id}", s.registerDevice)
+	mux.HandleFunc("GET /v1/devices/{id}", s.getDevice)
 	mux.HandleFunc("POST /v1/devices/{id}/events", s.ingest)
+	mux.HandleFunc("PUT /v1/devices/{id}/calibrations", s.applyCalibration)
+	mux.HandleFunc("GET /v1/devices/{id}/calibrations", s.listCalibrations)
 	mux.HandleFunc("POST /v1/devices/{id}/watermark", s.advanceWatermark)
 	mux.HandleFunc("GET /v1/devices/{id}/gaps", s.getGaps)
 	mux.HandleFunc("GET /v1/devices/{id}/events", s.listEvents)
@@ -68,6 +75,13 @@ type eventRequest struct {
 
 type watermarkRequest struct {
 	ClosedSeq int64 `json:"closedSeq"`
+}
+
+type calibrationRequestBody struct {
+	CalibrationID   string `json:"calibrationId"`
+	ParameterDigest string `json:"parameterDigest"`
+	EffectiveSeq    int64  `json:"effectiveSeq"`
+	Operator        string `json:"operator"`
 }
 
 type errorResponse struct {
@@ -95,6 +109,8 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not_found", "", err.Error())
 	case errors.Is(err, ErrDeviceExists):
 		writeError(w, http.StatusConflict, "device_exists", "", err.Error())
+	case errors.Is(err, ErrCalibrationConflict):
+		writeError(w, http.StatusConflict, "calibration_conflict", "calibration_conflict", err.Error())
 	case errors.Is(err, ErrInvalidArgument):
 		writeError(w, http.StatusBadRequest, "invalid_argument", "", err.Error())
 	default:
@@ -172,6 +188,51 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, outcome)
+}
+
+func (s *Server) getDevice(w http.ResponseWriter, r *http.Request) {
+	view, err := s.svc.GetDeviceView(r.PathValue("id"))
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) applyCalibration(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req calibrationRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "", err.Error())
+		return
+	}
+	res, err := s.svc.ApplyCalibration(id, CalibrationRequest{
+		ID:              req.CalibrationID,
+		ParameterDigest: req.ParameterDigest,
+		EffectiveSeq:    req.EffectiveSeq,
+		Operator:        req.Operator,
+	})
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if res.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, res)
+}
+
+func (s *Server) listCalibrations(w http.ResponseWriter, r *http.Request) {
+	cals, current, err := s.svc.ListCalibrations(r.PathValue("id"))
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"calibrations":         cals,
+		"currentCalibrationId": current,
+	})
 }
 
 func (s *Server) advanceWatermark(w http.ResponseWriter, r *http.Request) {

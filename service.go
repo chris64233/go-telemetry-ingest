@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,6 +40,10 @@ type Service struct {
 	// Store 的版本 CAS 兜底。
 	lockMu sync.Mutex
 	locks  map[string]*sync.Mutex
+
+	// calMu 串行化标定号的全局占用检查（标定号跨设备唯一）。
+	// 标定号索引保存在各设备状态内，持久化边界仍在 Store 帧上。
+	calMu sync.Mutex
 }
 
 // NewService 创建服务。
@@ -90,6 +95,167 @@ func (s *Service) ListDevices() ([]string, error) {
 	return s.store.ListDevices()
 }
 
+// ApplyCalibration 为设备登记（或重放）一条标定版本。
+//
+//   - 标定号全局唯一：相同标定号重放到同一设备且参数摘要、生效序号、
+//     操作者完全一致时幂等返回原结果（Duplicate=true）；设备或任一内容
+//     变化返回 ErrCalibrationConflict。
+//   - 生效序号不能早于已经确认的读数：effectiveSeq <= ackedSeq 时以
+//     ErrInvalidArgument 拒绝；也必须晚于已有标定的生效序号。拒绝路径
+//     不写入任何状态，当前有效标定版本保持不变。
+//   - 标定记录本身不可变；新版本从生效序号起适用于读数，当前有效版本
+//     在确认位置抵达生效序号后自然切换。
+func (s *Service) ApplyCalibration(deviceID string, req CalibrationRequest) (*CalibrationResult, error) {
+	if deviceID == "" {
+		return nil, fmt.Errorf("%w: device id is empty", ErrInvalidArgument)
+	}
+	if strings.TrimSpace(req.ID) == "" {
+		return nil, fmt.Errorf("%w: calibration id is empty", ErrInvalidArgument)
+	}
+	if req.ID == BaselineCalibrationID {
+		return nil, fmt.Errorf("%w: calibration id %q is reserved", ErrInvalidArgument, BaselineCalibrationID)
+	}
+	if strings.TrimSpace(req.ParameterDigest) == "" {
+		return nil, fmt.Errorf("%w: parameterDigest is empty", ErrInvalidArgument)
+	}
+	if strings.TrimSpace(req.Operator) == "" {
+		return nil, fmt.Errorf("%w: operator is empty", ErrInvalidArgument)
+	}
+	if req.EffectiveSeq <= 0 {
+		return nil, fmt.Errorf("%w: effectiveSeq must be >= 1", ErrInvalidArgument)
+	}
+
+	// 标定号全局占用检查 + 设备内提交在 calMu 下串行，杜绝两个设备并发
+	// 抢到同一个标定号。设备级锁仍保证与本设备读数/水位互斥。
+	s.calMu.Lock()
+	defer s.calMu.Unlock()
+	mu := s.deviceLock(deviceID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	for {
+		st, err := s.store.Load(deviceID)
+		if err != nil {
+			return nil, err
+		}
+
+		// 1) 同设备内已有该标定号：重放幂等或内容冲突。
+		for _, c := range st.Calibrations {
+			if c.ID != req.ID {
+				continue
+			}
+			if c.ParameterDigest != req.ParameterDigest ||
+				c.EffectiveSeq != req.EffectiveSeq || c.Operator != req.Operator {
+				return nil, fmt.Errorf("%w: calibration %q already recorded with different content", ErrCalibrationConflict, req.ID)
+			}
+			cur := currentCalibration(st)
+			return &CalibrationResult{
+				DeviceID:             deviceID,
+				Calibration:          c,
+				CurrentCalibrationID: cur.ID,
+				CurrentEffectiveSeq:  cur.EffectiveSeq,
+				Duplicate:            true,
+			}, nil
+		}
+
+		// 2) 标定号可能已被其他设备占用：扫描全部设备。
+		ids, err := s.store.ListDevices()
+		if err != nil {
+			return nil, err
+		}
+		for _, otherID := range ids {
+			if otherID == deviceID {
+				continue
+			}
+			other, lerr := s.store.Load(otherID)
+			if lerr != nil {
+				return nil, lerr
+			}
+			for _, c := range other.Calibrations {
+				if c.ID == req.ID {
+					return nil, fmt.Errorf("%w: calibration id %q already belongs to device %q", ErrCalibrationConflict, req.ID, otherID)
+				}
+			}
+		}
+
+		// 3) 生效序号边界：不能早于已确认读数，也不能早于已有版本。
+		if req.EffectiveSeq <= st.AckedSeq {
+			return nil, fmt.Errorf("%w: effectiveSeq %d must be greater than ackedSeq %d", ErrInvalidArgument, req.EffectiveSeq, st.AckedSeq)
+		}
+		last := st.Calibrations[len(st.Calibrations)-1]
+		if req.EffectiveSeq <= last.EffectiveSeq {
+			return nil, fmt.Errorf("%w: effectiveSeq %d must be greater than previous calibration effectiveSeq %d", ErrInvalidArgument, req.EffectiveSeq, last.EffectiveSeq)
+		}
+
+		now := s.now().UTC()
+		cal := Calibration{
+			ID:              req.ID,
+			ParameterDigest: req.ParameterDigest,
+			EffectiveSeq:    req.EffectiveSeq,
+			Operator:        req.Operator,
+			AppliedAt:       now,
+		}
+		prev := st.clone()
+		st.Calibrations = append(st.Calibrations, cal)
+		st.CalAggs[cal.ID] = &CalibrationAggregate{
+			CalibrationID:   cal.ID,
+			EffectiveSeq:    cal.EffectiveSeq,
+			ParameterDigest: cal.ParameterDigest,
+		}
+		st.Version++
+		st.UpdatedAt = now
+		if err := s.store.UpdateDevice(prev, st); err != nil {
+			if errors.Is(err, ErrConflictVersion) {
+				continue
+			}
+			return nil, err
+		}
+		cur := currentCalibration(st)
+		return &CalibrationResult{
+			DeviceID:             deviceID,
+			Calibration:          cal,
+			CurrentCalibrationID: cur.ID,
+			CurrentEffectiveSeq:  cur.EffectiveSeq,
+		}, nil
+	}
+}
+
+// currentCalibration 返回设备当前有效标定版本：生效序号 <= ackedSeq+1
+// 的最新一条（下一条待确认读数将采用它）。
+func currentCalibration(st *deviceState) Calibration {
+	return calibrationFor(st, st.AckedSeq+1)
+}
+
+// ListCalibrations 返回设备标定历史（按生效序号升序），并标注当前有效版本。
+func (s *Service) ListCalibrations(deviceID string) ([]Calibration, string, error) {
+	st, err := s.store.Load(deviceID)
+	if err != nil {
+		return nil, "", err
+	}
+	out := append([]Calibration(nil), st.Calibrations...)
+	return out, currentCalibration(st).ID, nil
+}
+
+// DeviceView 返回设备配置、标定历史与当前有效标定版本。
+func (s *Service) GetDeviceView(deviceID string) (*DeviceView, error) {
+	st, err := s.store.Load(deviceID)
+	if err != nil {
+		return nil, err
+	}
+	cur := currentCalibration(st)
+	return &DeviceView{
+		Device: Device{
+			ID:           st.ID,
+			Window:       st.Window,
+			RegisteredAt: st.RegisteredAt,
+		},
+		Calibrations:         append([]Calibration(nil), st.Calibrations...),
+		CurrentCalibrationID: cur.ID,
+		AckedSeq:             st.AckedSeq,
+		ClosedSeq:            st.ClosedSeq,
+	}, nil
+}
+
 func validateEvent(e Event) error {
 	if e.Sequence <= 0 {
 		return fmt.Errorf("%w: sequence must be >= 1", ErrInvalidArgument)
@@ -114,7 +280,9 @@ func validateEvent(e Event) error {
 //   - 被拒绝：*IngestOutcome（Status=rejected）同时返回 *RejectedError，
 //     拒绝原因已持久化；冲突时 errors.Is(err, ErrConflict) 成立。
 //
-// 汇总与确认位置的推进在同一个 Store 事务内完成。
+// 读数在首次到达时按序号绑定唯一标定版本（保存版本生效序号与参数摘要作为
+// 采用依据），此后标定切换不会改绑。汇总、按标定版本聚合与确认位置的推进
+// 在同一个 Store 事务内完成。
 func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 	if err := validateEvent(e); err != nil {
 		return nil, err
@@ -128,18 +296,20 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 		if err != nil {
 			return nil, err
 		}
+		boundCal := calibrationFor(st, e.Sequence)
 
 		// 1) 相同序号：去重 / 冲突。
 		if existing, ok := st.Events[e.Sequence]; ok {
 			if e.sameContent(existing.Event) {
 				return &IngestOutcome{
-					DeviceID:  deviceID,
-					Status:    existing.FirstResult,
-					AckedSeq:  st.AckedSeq,
-					Duplicate: true,
+					DeviceID:      deviceID,
+					Status:        existing.FirstResult,
+					AckedSeq:      st.AckedSeq,
+					CalibrationID: existing.CalibrationID,
+					Duplicate:     true,
 				}, nil
 			}
-			out, rerr := s.recordRejection(st, e, ReasonConflict,
+			out, rerr := s.recordRejection(st, e, boundCal, ReasonConflict,
 				fmt.Sprintf("sequence %d already exists with different content", e.Sequence))
 			if errors.Is(rerr, ErrConflictVersion) {
 				continue
@@ -149,7 +319,7 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 
 		// 2) 已被关闭水位永久关闭（迟到）。
 		if e.Sequence <= st.ClosedSeq {
-			out, rerr := s.recordRejection(st, e, ReasonLate,
+			out, rerr := s.recordRejection(st, e, boundCal, ReasonLate,
 				fmt.Sprintf("sequence %d is below closed watermark %d", e.Sequence, st.ClosedSeq))
 			if errors.Is(rerr, ErrConflictVersion) {
 				continue
@@ -160,7 +330,7 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 		// 3) 超出乱序窗口：acked+1 是下一个期望序号，其之后还允许提前
 		// window 个序号（上限 acked+1+window）。
 		if e.Sequence > st.AckedSeq+1+st.Window {
-			out, rerr := s.recordRejection(st, e, ReasonOutOfWindow,
+			out, rerr := s.recordRejection(st, e, boundCal, ReasonOutOfWindow,
 				fmt.Sprintf("sequence %d exceeds window (acked=%d, window=%d)", e.Sequence, st.AckedSeq, st.Window))
 			if errors.Is(rerr, ErrConflictVersion) {
 				continue
@@ -177,9 +347,12 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 		prev := st.clone()
 		now := s.now().UTC()
 		st.Events[e.Sequence] = &storedEvent{
-			Event:       e,
-			FirstResult: ResultBuffered,
-			ReceivedAt:  now,
+			Event:                   e,
+			FirstResult:             ResultBuffered,
+			ReceivedAt:              now,
+			CalibrationID:           boundCal.ID,
+			CalibrationEffectiveSeq: boundCal.EffectiveSeq,
+			CalibrationDigest:       boundCal.ParameterDigest,
 		}
 		drain(st)
 		status := ResultBuffered
@@ -197,11 +370,26 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 			return nil, err
 		}
 		return &IngestOutcome{
-			DeviceID: deviceID,
-			Status:   status,
-			AckedSeq: st.AckedSeq,
+			DeviceID:      deviceID,
+			Status:        status,
+			AckedSeq:      st.AckedSeq,
+			CalibrationID: boundCal.ID,
 		}, nil
 	}
+}
+
+// calibrationFor 返回序号 seq 在当前标定历史下应采用的标定版本：
+// 生效序号 <= seq 的最新一条。标定记录按生效序号升序保存。
+func calibrationFor(st *deviceState, seq int64) Calibration {
+	chosen := st.Calibrations[0]
+	for _, c := range st.Calibrations {
+		if c.EffectiveSeq <= seq {
+			chosen = c
+		} else {
+			break
+		}
+	}
+	return chosen
 }
 
 // checkTimeOrder 校验事件时间相对已存储的相邻序号严格递增，返回非空错误描述。
@@ -240,6 +428,7 @@ func drain(st *deviceState) {
 			return
 		}
 		applyToSummary(st, next.Event)
+		applyToCalibrationAgg(st, next)
 		st.AckedSeq++
 	}
 }
@@ -263,33 +452,63 @@ func applyToSummary(st *deviceState, e Event) {
 	st.LastTime = e.EventTime
 }
 
+// applyToCalibrationAgg 把读数按其绑定的标定版本恰好一次计入该版本聚合。
+func applyToCalibrationAgg(st *deviceState, se *storedEvent) {
+	agg, ok := st.CalAggs[se.CalibrationID]
+	if !ok {
+		agg = &CalibrationAggregate{
+			CalibrationID:   se.CalibrationID,
+			EffectiveSeq:    se.CalibrationEffectiveSeq,
+			ParameterDigest: se.CalibrationDigest,
+		}
+		st.CalAggs[se.CalibrationID] = agg
+	}
+	e := se.Event
+	agg.EventCount++
+	agg.Sum += e.Value
+	if agg.EventCount == 1 {
+		agg.Min, agg.Max = e.Value, e.Value
+		agg.FirstEventTime = e.EventTime
+	} else {
+		if e.Value < agg.Min {
+			agg.Min = e.Value
+		}
+		if e.Value > agg.Max {
+			agg.Max = e.Value
+		}
+	}
+	agg.LastEventTime = e.EventTime
+}
+
 // recordRejection 在同一事务中追加拒绝记录并提交；对完全相同的拒绝
 // 提交（同序号、同内容、同原因）幂等返回既有结果。
 // 成功时返回的 error 为 *RejectedError；CAS 冲突时原样返回 ErrConflictVersion。
-func (s *Service) recordRejection(st *deviceState, e Event, reason, detail string) (*IngestOutcome, error) {
+func (s *Service) recordRejection(st *deviceState, e Event, bound Calibration, reason, detail string) (*IngestOutcome, error) {
 	for _, r := range st.Rejections {
 		if r.Sequence == e.Sequence && r.Reason == reason &&
 			r.Metric == e.Metric && r.Value == e.Value && r.EventTime.Equal(e.EventTime) {
 			out := &IngestOutcome{
-				DeviceID:  st.ID,
-				Status:    ResultRejected,
-				AckedSeq:  st.AckedSeq,
-				Reason:    reason,
-				Detail:    detail,
-				Duplicate: true,
+				DeviceID:      st.ID,
+				Status:        ResultRejected,
+				AckedSeq:      st.AckedSeq,
+				CalibrationID: r.CalibrationID,
+				Reason:        reason,
+				Detail:        detail,
+				Duplicate:     true,
 			}
 			return out, &RejectedError{Outcome: out}
 		}
 	}
 	now := s.now().UTC()
 	rec := Rejection{
-		Sequence:   e.Sequence,
-		EventTime:  e.EventTime,
-		Metric:     e.Metric,
-		Value:      e.Value,
-		Reason:     reason,
-		Detail:     detail,
-		RejectedAt: now,
+		Sequence:      e.Sequence,
+		EventTime:     e.EventTime,
+		Metric:        e.Metric,
+		Value:         e.Value,
+		CalibrationID: bound.ID,
+		Reason:        reason,
+		Detail:        detail,
+		RejectedAt:    now,
 	}
 	prev := st.clone()
 	st.Rejections = append(st.Rejections, rec)
@@ -299,11 +518,12 @@ func (s *Service) recordRejection(st *deviceState, e Event, reason, detail strin
 		return nil, err
 	}
 	out := &IngestOutcome{
-		DeviceID: st.ID,
-		Status:   ResultRejected,
-		AckedSeq: st.AckedSeq,
-		Reason:   reason,
-		Detail:   detail,
+		DeviceID:      st.ID,
+		Status:        ResultRejected,
+		AckedSeq:      st.AckedSeq,
+		CalibrationID: bound.ID,
+		Reason:        reason,
+		Detail:        detail,
 	}
 	return out, &RejectedError{Outcome: out}
 }
@@ -389,6 +609,7 @@ func sealAndSettle(st *deviceState, target int64, now time.Time) []Gap {
 		if ev, ok := st.Events[seq]; ok {
 			flushGap()
 			applyToSummary(st, ev.Event)
+			applyToCalibrationAgg(st, ev)
 		} else {
 			if gapStart == 0 {
 				gapStart, gapEnd = seq, seq
@@ -468,10 +689,13 @@ func (s *Service) ListEvents(deviceID string, from, limit int64) ([]EventRecord,
 		}
 		se := st.Events[seq]
 		out = append(out, EventRecord{
-			Event:        se.Event,
-			FirstResult:  se.FirstResult,
-			Acknowledged: seq <= st.AckedSeq,
-			ReceivedAt:   se.ReceivedAt,
+			Event:                   se.Event,
+			FirstResult:             se.FirstResult,
+			Acknowledged:            seq <= st.AckedSeq,
+			ReceivedAt:              se.ReceivedAt,
+			CalibrationID:           se.CalibrationID,
+			CalibrationEffectiveSeq: se.CalibrationEffectiveSeq,
+			CalibrationDigest:       se.CalibrationDigest,
 		})
 	}
 	return out, nil
