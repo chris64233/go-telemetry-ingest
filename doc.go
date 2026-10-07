@@ -8,6 +8,8 @@
 //
 // 核心组件：
 //   - Service：接收/确认推进/关闭水位/查询的状态机（service.go）
+//   - 标定版本：Calibration/ApplyCalibration（calibration.go），读数在确认时
+//     绑定唯一适用版本并保存依据，旧标定迟到读数只进历史诊断区
 //   - Store：设备状态持久化抽象（store.go），FileStore 为 WAL+快照实现，
 //     MemoryStore 为内存实现
 //   - HTTP API：见 http.go

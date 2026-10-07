@@ -133,10 +133,13 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 		if existing, ok := st.Events[e.Sequence]; ok {
 			if e.sameContent(existing.Event) {
 				return &IngestOutcome{
-					DeviceID:  deviceID,
-					Status:    existing.FirstResult,
-					AckedSeq:  st.AckedSeq,
-					Duplicate: true,
+					DeviceID:        deviceID,
+					Status:          existing.FirstResult,
+					AckedSeq:        st.AckedSeq,
+					Duplicate:       true,
+					CalibrationID:   existing.CalibrationID,
+					CalibratedValue: existing.CalibratedValue,
+					Basis:           existing.Basis,
 				}, nil
 			}
 			out, rerr := s.recordRejection(st, e, ReasonConflict,
@@ -149,8 +152,7 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 
 		// 2) 已被关闭水位永久关闭（迟到）。
 		if e.Sequence <= st.ClosedSeq {
-			out, rerr := s.recordRejection(st, e, ReasonLate,
-				fmt.Sprintf("sequence %d is below closed watermark %d", e.Sequence, st.ClosedSeq))
+			out, rerr := s.recordLateReading(st, e)
 			if errors.Is(rerr, ErrConflictVersion) {
 				continue
 			}
@@ -196,10 +198,14 @@ func (s *Service) Ingest(deviceID string, e Event) (*IngestOutcome, error) {
 			}
 			return nil, err
 		}
+		bound := st.Events[e.Sequence]
 		return &IngestOutcome{
-			DeviceID: deviceID,
-			Status:   status,
-			AckedSeq: st.AckedSeq,
+			DeviceID:        deviceID,
+			Status:          status,
+			AckedSeq:        st.AckedSeq,
+			CalibrationID:   bound.CalibrationID,
+			CalibratedValue: bound.CalibratedValue,
+			Basis:           bound.Basis,
 		}, nil
 	}
 }
@@ -239,28 +245,62 @@ func drain(st *deviceState) {
 		if !ok {
 			return
 		}
-		applyToSummary(st, next.Event)
+		bindCalibration(st, next, CalBasisAcked)
+		applyToSummary(st, next)
 		st.AckedSeq++
 	}
 }
 
-// applyToSummary 把一个事件按序号顺序计入汇总。调用顺序严格递增，
+// bindCalibration 为一条读数绑定其唯一适用的标定版本并保存采用依据。
+// 绑定只在确认/结算路径发生（同一持久化事务），此后不可更改；
+// 已绑定的事件重复经过时保持幂等。
+func bindCalibration(st *deviceState, se *storedEvent, basis string) {
+	if se.CalibrationID != "" {
+		return
+	}
+	cal := st.calibrationAt(se.Event.Sequence)
+	se.CalibrationID = cal.CalibrationID
+	se.CalibratedValue = cal.Params.Apply(se.Event.Value)
+	se.Basis = basis
+}
+
+// applyToSummary 把一个已绑定标定版本的事件按序号顺序计入总聚合与
+// 该标定版本的分段聚合（均使用标定后的值）。调用顺序严格递增，
 // 因此 LastTime/Min/Max 不需要跨事件重排。
-func applyToSummary(st *deviceState, e Event) {
+func applyToSummary(st *deviceState, se *storedEvent) {
+	value := se.CalibratedValue
 	st.EventCount++
-	st.Sum += e.Value
+	st.Sum += value
 	if st.EventCount == 1 {
-		st.Min, st.Max = e.Value, e.Value
-		st.FirstTime = e.EventTime
+		st.Min, st.Max = value, value
+		st.FirstTime = se.Event.EventTime
 	} else {
-		if e.Value < st.Min {
-			st.Min = e.Value
+		if value < st.Min {
+			st.Min = value
 		}
-		if e.Value > st.Max {
-			st.Max = e.Value
+		if value > st.Max {
+			st.Max = value
 		}
 	}
-	st.LastTime = e.EventTime
+	st.LastTime = se.Event.EventTime
+
+	seg, ok := st.SegmentStats[se.CalibrationID]
+	if !ok {
+		seg = &calibStat{}
+		st.SegmentStats[se.CalibrationID] = seg
+	}
+	seg.EventCount++
+	seg.Sum += value
+	if seg.EventCount == 1 {
+		seg.Min, seg.Max = value, value
+	} else {
+		if value < seg.Min {
+			seg.Min = value
+		}
+		if value > seg.Max {
+			seg.Max = value
+		}
+	}
 }
 
 // recordRejection 在同一事务中追加拒绝记录并提交；对完全相同的拒绝
@@ -304,6 +344,76 @@ func (s *Service) recordRejection(st *deviceState, e Event, reason, detail strin
 		AckedSeq: st.AckedSeq,
 		Reason:   reason,
 		Detail:   detail,
+	}
+	return out, &RejectedError{Outcome: out}
+}
+
+// recordLateReading 处理关闭水位之后到达的旧标定迟到读数：
+// 读数可以被记录进历史诊断区（保留其本应采用的旧标定版本与标定值），
+// 但绝不回写当前聚合；同时保留一条 late 拒绝原因。
+// 对相同序号、相同内容的迟到重放幂等返回原结果；相同序号、不同内容返回冲突。
+// CAS 冲突时原样返回 ErrConflictVersion 供上层重试。
+func (s *Service) recordLateReading(st *deviceState, e Event) (*IngestOutcome, error) {
+	detail := fmt.Sprintf("sequence %d is below closed watermark %d", e.Sequence, st.ClosedSeq)
+	cal := st.calibrationAt(e.Sequence)
+	calibrated := cal.Params.Apply(e.Value)
+
+	// 诊断区/拒绝记录中已有相同序号：相同内容幂等，不同内容冲突。
+	for _, lr := range st.LateReadings {
+		if lr.Event.Sequence != e.Sequence {
+			continue
+		}
+		if !e.sameContent(lr.Event) {
+			out, rerr := s.recordRejection(st, e, ReasonConflict,
+				fmt.Sprintf("late sequence %d already recorded with different content", e.Sequence))
+			return out, rerr
+		}
+		out := &IngestOutcome{
+			DeviceID:        st.ID,
+			Status:          ResultRejected,
+			AckedSeq:        st.AckedSeq,
+			Reason:          ReasonLate,
+			Detail:          detail,
+			Duplicate:       true,
+			CalibrationID:   lr.CalibrationID,
+			CalibratedValue: lr.CalibratedValue,
+			Basis:           CalBasisLate,
+		}
+		return out, &RejectedError{Outcome: out}
+	}
+
+	now := s.now().UTC()
+	prev := st.clone()
+	st.LateReadings = append(st.LateReadings, LateReading{
+		Event:           e,
+		CalibrationID:   cal.CalibrationID,
+		CalibratedValue: calibrated,
+		RecordedAt:      now,
+	})
+	st.Rejections = append(st.Rejections, Rejection{
+		Sequence:      e.Sequence,
+		EventTime:     e.EventTime,
+		Metric:        e.Metric,
+		Value:         e.Value,
+		Reason:        ReasonLate,
+		Detail:        detail,
+		RejectedAt:    now,
+		CalibrationID: cal.CalibrationID,
+	})
+	st.Version++
+	st.UpdatedAt = now
+	if err := s.store.UpdateDevice(prev, st); err != nil {
+		return nil, err
+	}
+	out := &IngestOutcome{
+		DeviceID:        st.ID,
+		Status:          ResultRejected,
+		AckedSeq:        st.AckedSeq,
+		Reason:          ReasonLate,
+		Detail:          detail,
+		CalibrationID:   cal.CalibrationID,
+		CalibratedValue: calibrated,
+		Basis:           CalBasisLate,
 	}
 	return out, &RejectedError{Outcome: out}
 }
@@ -388,7 +498,8 @@ func sealAndSettle(st *deviceState, target int64, now time.Time) []Gap {
 	for seq := st.AckedSeq + 1; seq <= target; seq++ {
 		if ev, ok := st.Events[seq]; ok {
 			flushGap()
-			applyToSummary(st, ev.Event)
+			bindCalibration(st, ev, CalBasisSettled)
+			applyToSummary(st, ev)
 		} else {
 			if gapStart == 0 {
 				gapStart, gapEnd = seq, seq
@@ -468,10 +579,13 @@ func (s *Service) ListEvents(deviceID string, from, limit int64) ([]EventRecord,
 		}
 		se := st.Events[seq]
 		out = append(out, EventRecord{
-			Event:        se.Event,
-			FirstResult:  se.FirstResult,
-			Acknowledged: seq <= st.AckedSeq,
-			ReceivedAt:   se.ReceivedAt,
+			Event:           se.Event,
+			FirstResult:     se.FirstResult,
+			Acknowledged:    seq <= st.AckedSeq,
+			ReceivedAt:      se.ReceivedAt,
+			CalibrationID:   se.CalibrationID,
+			CalibratedValue: se.CalibratedValue,
+			Basis:           se.Basis,
 		})
 	}
 	return out, nil

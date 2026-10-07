@@ -27,6 +27,13 @@ type deviceState struct {
 	SealedGaps []SealedGap `json:"sealedGaps"`
 	// Rejections 被拒绝的提交及原因（按时间追加）。
 	Rejections []Rejection `json:"rejections"`
+	// Calibrations 标定历史（按 EffectiveSeq 升序，首条为 baseline）。
+	Calibrations []Calibration `json:"calibrations"`
+	// SegmentStats 各标定版本下的已确认聚合，键为标定版本号。
+	// 与 AckedSeq 在同一帧推进，保证恰好一次。
+	SegmentStats map[string]*calibStat `json:"segmentStats"`
+	// LateReadings 旧标定的迟到读数（历史诊断区），永不回写聚合。
+	LateReadings []LateReading `json:"lateReadings"`
 	// Summary 恰好一次累计的汇总；其推进与 AckedSeq 在同一帧提交。
 	Sum        float64   `json:"sum"`
 	Min        float64   `json:"min"`
@@ -44,6 +51,28 @@ func newDeviceState(d Device) *deviceState {
 		RegisteredAt: d.RegisteredAt,
 		Version:      1,
 		Events:       make(map[int64]*storedEvent),
+		SegmentStats: make(map[string]*calibStat),
+		Calibrations: []Calibration{baselineCalibration(d.ID, d.RegisteredAt)},
+	}
+}
+
+// calibStat 是单个标定版本段的聚合（使用标定后的值）。
+type calibStat struct {
+	EventCount int64   `json:"eventCount"`
+	Sum        float64 `json:"sum"`
+	Min        float64 `json:"min"`
+	Max        float64 `json:"max"`
+}
+
+func baselineCalibration(deviceID string, now time.Time) Calibration {
+	return Calibration{
+		CalibrationID: BaselineCalibrationID,
+		DeviceID:      deviceID,
+		EffectiveSeq:  1,
+		Params:        CalibrationParams{Scale: 1, Offset: 0},
+		Digest:        digestParams(CalibrationParams{Scale: 1, Offset: 0}),
+		Operator:      "system",
+		CreatedAt:     now,
 	}
 }
 
@@ -56,23 +85,73 @@ func (s *deviceState) clone() *deviceState {
 	}
 	c.SealedGaps = append([]SealedGap(nil), s.SealedGaps...)
 	c.Rejections = append([]Rejection(nil), s.Rejections...)
+	c.Calibrations = append([]Calibration(nil), s.Calibrations...)
+	c.LateReadings = append([]LateReading(nil), s.LateReadings...)
+	if s.SegmentStats != nil {
+		c.SegmentStats = make(map[string]*calibStat, len(s.SegmentStats))
+		for k, v := range s.SegmentStats {
+			st := *v
+			c.SegmentStats[k] = &st
+		}
+	}
 	return &c
 }
 
 // summary 从持久化状态构造对外的汇总视图。
 func (s *deviceState) summary() Summary {
-	return Summary{
-		DeviceID:       s.ID,
-		AckedSeq:       s.AckedSeq,
-		ClosedSeq:      s.ClosedSeq,
-		EventCount:     s.EventCount,
-		Sum:            s.Sum,
-		Min:            s.Min,
-		Max:            s.Max,
-		FirstEventTime: s.FirstTime,
-		LastEventTime:  s.LastTime,
-		UpdatedAt:      s.UpdatedAt,
+	current := s.currentCalibration()
+	sum := Summary{
+		DeviceID:            s.ID,
+		AckedSeq:            s.AckedSeq,
+		ClosedSeq:           s.ClosedSeq,
+		EventCount:          s.EventCount,
+		Sum:                 s.Sum,
+		Min:                 s.Min,
+		Max:                 s.Max,
+		FirstEventTime:      s.FirstTime,
+		LastEventTime:       s.LastTime,
+		UpdatedAt:           s.UpdatedAt,
+		CurrentCalibration:  current,
+		Calibrations:        append([]Calibration(nil), s.Calibrations...),
+		Segments:            []CalibrationSummary{},
+		DiagnosticLateCount: int64(len(s.LateReadings)),
 	}
+	for _, cal := range s.Calibrations {
+		seg := &CalibrationSummary{
+			CalibrationID: cal.CalibrationID,
+			EffectiveSeq:  cal.EffectiveSeq,
+			Digest:        cal.Digest,
+			Params:        cal.Params,
+			Current:       cal.CalibrationID == current.CalibrationID,
+		}
+		if stat, ok := s.SegmentStats[cal.CalibrationID]; ok {
+			seg.EventCount = stat.EventCount
+			seg.Sum = stat.Sum
+			seg.Min = stat.Min
+			seg.Max = stat.Max
+		}
+		sum.Segments = append(sum.Segments, *seg)
+	}
+	return sum
+}
+
+// calibrationAt 返回序号 seq 适用的标定版本（EffectiveSeq <= seq 的最后一条）。
+// 调用前 Calibrations 必须至少含 baseline。
+func (s *deviceState) calibrationAt(seq int64) Calibration {
+	chosen := s.Calibrations[0]
+	for _, c := range s.Calibrations {
+		if c.EffectiveSeq <= seq {
+			chosen = c
+		} else {
+			break
+		}
+	}
+	return chosen
+}
+
+// currentCalibration 返回当前有效（生效序号最大）的标定版本。
+func (s *deviceState) currentCalibration() Calibration {
+	return s.Calibrations[len(s.Calibrations)-1]
 }
 
 // Store 是设备状态的持久化抽象。

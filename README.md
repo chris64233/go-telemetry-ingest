@@ -39,6 +39,33 @@
 5. **查询能力**：设备登记、事件接收、水位推进、缺口查询、原始事件查询、
    汇总查询、拒绝原因查询、设备列表。
 
+## 标定版本（Calibration）
+
+设备更换传感器后，后续读数需要使用新的标定参数；旧标定下产生的迟到数据
+只能留在历史区，不能改变当前统计。标定值 = 原始读数 `value * scale + offset`。
+
+1. **标定记录**：每条记录固定**设备、参数摘要（SHA256）、生效序号和操作者**。
+   设备登记时自动建立 `baseline` 版本（scale=1, offset=0，自序号 1 生效，
+   操作者 `system`）。新生效序号必须**严格大于已确认读数序号 `ackedSeq`**
+   （不能早于已经确认的读数），且不小于上一个版本的生效序号；`scale>0`、
+   操作者非空。标定失败（非法入参/冲突）不写入记录、不改变当前有效版本。
+2. **每条读数恰好一个标定版本，并保存采用依据**：读数上报时携带的是原始值；
+   标定版本在**确认时刻**绑定——连续确认（drain）为 `at_ack`，水位结算为
+   `at_watermark_settle`。因此先 buffered、之后才标定切换的读数，也会按其
+   序号绑定正确版本；绑定与汇总推进在**同一持久化事务（同一 WAL 帧）**中
+   完成，读数、标定切换与窗口汇总并发时仍线性化、不丢不重。
+3. **旧标定迟到读数**：水位关闭后到达的读数按其序号对应的旧标定换算后
+   **记录进历史诊断区**（`diagnostics/late`，含标定版本号、标定值与
+   `late_diagnostic` 依据），但**绝不回写当前聚合**；相同读数号不同内容
+   返回 `conflict`，相同内容重放幂等。
+4. **标定号重放**：相同标定号、相同设备/参数/生效序号/操作者重放时幂等
+   返回原结果（`replayed=true`）；设备、参数（摘要）、生效序号或操作者
+   任一变化返回 `conflict`。
+5. **查询**：汇总返回当前有效标定、按生效序号升序的标定历史，以及按标定
+   版本分段的聚合 `segments`——最后一段 `current=true` 为**当前值**，
+   其余段为**历史诊断值**（旧标定下的 count/sum/min/max）；原始事件查询
+   带出每条读数的序号、采用的标定版本、标定值与绑定依据。
+
 ## 架构
 
 ```
@@ -80,6 +107,12 @@ out, err := svc.Ingest("sensor-1", gti.Event{
 res, _ := svc.AdvanceWatermark("sensor-1", 100) // 关闭水位，结算缺口
 sum, _ := svc.Summary("sensor-1")
 gaps, _ := svc.Gaps("sensor-1")                 // open / sealed 缺口
+
+svc.ApplyCalibration("sensor-1", "cal-2026-10",  // 标定号
+	101,                                          // 生效序号（必须 > ackedSeq）
+	gti.CalibrationParams{Scale: 1.05, Offset: -0.2}, "alice")
+cals, _ := svc.ListCalibrations("sensor-1")       // 标定历史（含 baseline）
+lates, _ := svc.ListLateReadings("sensor-1", 0)   // 旧标定迟到读数（历史诊断）
 ```
 
 ## HTTP API
@@ -96,12 +129,27 @@ gaps, _ := svc.Gaps("sensor-1")                 // open / sealed 缺口
 | `GET` | `/v1/devices/{id}/events?from=&limit=` | 原始事件（按序号升序） |
 | `GET` | `/v1/devices/{id}/summary` | 汇总 |
 | `GET` | `/v1/devices/{id}/rejections?limit=` | 拒绝原因（按时间倒序） |
+| `PUT` | `/v1/devices/{id}/calibrations/{cid}` | 标定切换（同号重放幂等 200，新建 201） |
+| `GET` | `/v1/devices/{id}/calibrations` | 标定历史（含 baseline，按生效序号升序） |
+| `GET` | `/v1/devices/{id}/diagnostics/late?limit=` | 旧标定迟到读数（历史诊断区，按记录时间倒序） |
 
 事件 body：
 
 ```json
 {"sequence":1,"eventTime":"2026-09-28T00:00:00Z","metric":"temp","value":23.5}
 ```
+
+标定 body（`effectiveSeq` 必须 > 当前 `ackedSeq`）：
+
+```json
+{"effectiveSeq":10,"scale":1.05,"offset":-0.2,"operator":"alice"}
+```
+
+事件响应额外返回 `calibrationId`、`calibratedValue`、`calibrationBasis`
+（`at_ack` / `at_watermark_settle`；buffered 未确认时为空；迟到拒绝时为
+`late_diagnostic`）。汇总 body 含 `currentCalibration`、`calibrations`、
+`segments`（分段聚合，旧段 `current=false` 为历史诊断值）与
+`diagnosticLateCount`。
 
 状态码：成功/重复 `200`，登记 `201`；冲突/超窗/迟到 `409`（body 含 `reason`）；
 设备不存在 `404`；入参非法 `400`。
@@ -141,7 +189,14 @@ go test -race ./...
 - WAL 重启不重复累加、重复提交幂等、水位/拒绝记录跨重启保留；
 - 快照压缩后重启状态完整；崩溃尾部半帧自动截断恢复；
 - CAS 版本冲突自动重试；
-- HTTP 端到端（登记幂等、acked/buffered/duplicate/conflict/late、各查询、错误码）。
+- HTTP 端到端（登记幂等、acked/buffered/duplicate/conflict/late、各查询、错误码）；
+- **标定版本**：baseline 自动建立、切换边界（生效序号必须 > acked）、
+  乱序 buffered 读数在确认/水位结算时绑定唯一标定版本并保存依据、
+  当前值与历史诊断值分段展示；
+- 旧标定迟到读数进历史诊断区且不回写聚合、同号异内容冲突、重放幂等；
+- 相同标定号重放返回原结果，设备/参数/生效序号/操作者变化冲突，失败不改当前版本；
+- 读数、标定切换与汇总查询并发（内存/文件两种存储）分段计数不丢不重，
+  标定历史/采用依据跨 WAL 重启保留。
 
 ## 范围与取舍
 

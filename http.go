@@ -22,6 +22,10 @@ import (
 //	GET    /v1/devices/:id/summary            汇总查询
 //	GET    /v1/devices/:id/rejections?limit=  拒绝原因查询
 //	GET    /v1/devices                        设备列表
+//	PUT    /v1/devices/:id/calibrations/:cid  标定切换
+//	      {"effectiveSeq":10,"scale":1.05,"offset":-0.2,"operator":"alice"}
+//	GET    /v1/devices/:id/calibrations       标定历史
+//	GET    /v1/devices/:id/diagnostics/late?limit= 旧标定迟到读数（历史诊断区）
 //
 // 事件成功接收返回 200；重复提交返回 200 且 duplicate=true；
 // 冲突/超窗/迟到返回 409 并在 body 中给出 reason；设备不存在返回 404；
@@ -52,6 +56,9 @@ func NewHTTPServer(svc *Service, logger *log.Logger) http.Handler {
 	mux.HandleFunc("GET /v1/devices/{id}/events", s.listEvents)
 	mux.HandleFunc("GET /v1/devices/{id}/summary", s.getSummary)
 	mux.HandleFunc("GET /v1/devices/{id}/rejections", s.listRejections)
+	mux.HandleFunc("PUT /v1/devices/{id}/calibrations/{cid}", s.applyCalibration)
+	mux.HandleFunc("GET /v1/devices/{id}/calibrations", s.listCalibrations)
+	mux.HandleFunc("GET /v1/devices/{id}/diagnostics/late", s.listLateReadings)
 	return mux
 }
 
@@ -68,6 +75,13 @@ type eventRequest struct {
 
 type watermarkRequest struct {
 	ClosedSeq int64 `json:"closedSeq"`
+}
+
+type calibrationRequest struct {
+	EffectiveSeq int64   `json:"effectiveSeq"`
+	Scale        float64 `json:"scale"`
+	Offset       float64 `json:"offset"`
+	Operator     string  `json:"operator"`
 }
 
 type errorResponse struct {
@@ -95,6 +109,8 @@ func mapServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not_found", "", err.Error())
 	case errors.Is(err, ErrDeviceExists):
 		writeError(w, http.StatusConflict, "device_exists", "", err.Error())
+	case errors.Is(err, ErrConflict):
+		writeError(w, http.StatusConflict, "conflict", ReasonConflict, err.Error())
 	case errors.Is(err, ErrInvalidArgument):
 		writeError(w, http.StatusBadRequest, "invalid_argument", "", err.Error())
 	default:
@@ -250,6 +266,54 @@ func (s *Server) listRejections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"rejections": recs})
+}
+
+func (s *Server) applyCalibration(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cid := r.PathValue("cid")
+	var req calibrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "", err.Error())
+		return
+	}
+	res, err := s.svc.ApplyCalibration(id, cid, req.EffectiveSeq,
+		CalibrationParams{Scale: req.Scale, Offset: req.Offset}, req.Operator)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if res.Replayed {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, res)
+}
+
+func (s *Server) listCalibrations(w http.ResponseWriter, r *http.Request) {
+	cals, err := s.svc.ListCalibrations(r.PathValue("id"))
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"calibrations": cals})
+}
+
+func (s *Server) listLateReadings(w http.ResponseWriter, r *http.Request) {
+	var limit int64
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_argument", "", "limit must be a non-negative integer")
+			return
+		}
+		limit = n
+	}
+	readings, err := s.svc.ListLateReadings(r.PathValue("id"), limit)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lateReadings": readings})
 }
 
 // ListenAndServe 启动 HTTP 服务的便捷封装。
